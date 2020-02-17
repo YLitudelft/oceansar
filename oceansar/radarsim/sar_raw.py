@@ -46,6 +46,7 @@ from oceansar.radarsim import range_profile as raw
 
 from oceansar.surfaces import OceanSurface, OceanSurfaceBalancer
 from oceansar.swell_spec import dir_swell_spec as s_spec
+from drama.performance.sar.antenna_patterns import pattern as ant_pat
 
 
 def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reuse_errors_file,
@@ -112,6 +113,10 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
     phase_n_rx = np.deg2rad(cfg.sar.phase_n_rx)
     sigma_beta_rx = cfg.sar.sigma_beta_rx
     phase_beta_rx = np.deg2rad(cfg.sar.phase_beta_rx)
+    
+    # FOR CROSS-TRACK INTERFEROMETRY
+    if hasattr(cfg.sar, 'b_cross'):
+         num_ch = np.size(cfg.sar.b_cross)
 
     # OCEAN / OTHERS
     ocean_dt = cfg.ocean.dt
@@ -230,6 +235,7 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
 
     # Initialize surface balancer
     surface = OceanSurfaceBalancer(surface_full, ocean_dt)
+    
 
     # CALCULATE PARAMETERS
     if rank == 0:
@@ -340,6 +346,46 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
     ###################
     if rank == 0:
         print('Computing profiles...')
+        
+        
+        print('Initializing antenna pattern...')
+        gr_m, y_m = np.meshgrid(gr,surface.y)
+        sr_m = np.sqrt(gr_m**2 + y_m**2 + alt**2)
+        v = np.arcsin(alt / sr_m)
+        u = np.arcsin(y_m / sr_m)
+        # Initialize the antenna pattern
+        # The two transmit antenna and the receive antenna are separated
+        tx_ant = ant_pat(cfg.sar.f0,
+                         type_a=cfg.node_tx.type_a,
+                         type_e=cfg.node_tx.type_e,
+                         La=cfg.node_tx.La,
+                         Le=cfg.node_tx.Le,
+                         el0=(np.degrees(np.mean(v))),
+                         Nel_a=cfg.node_tx.Na,
+                         Nel_e=cfg.node_tx.Ne,
+                         wa=cfg.node_tx.wa_tx,
+                         we=cfg.node_tx.we_tx,
+                         spacing_a=cfg.node_tx.spacing_a, 
+                         spacing_e=cfg.node_tx.spacing_e,
+                         steering_rate=0,
+                         Tanalysis=1,
+                         squint=0)
+    
+        rx_ant = ant_pat(cfg.sar.f0,
+                         type_a=cfg.node_rx.type_a,
+                         type_e=cfg.node_rx.type_e,
+                         La=cfg.node_rx.La,
+                         Le=cfg.node_rx.Le,
+                         el0=(np.degrees(np.mean(v))),
+                         Nel_a=cfg.node_rx.Na,
+                         Nel_e=cfg.node_rx.Ne,
+                         wa=cfg.node_rx.wa_rx,
+                         we=cfg.node_rx.we_rx,
+                         spacing_a=cfg.node_rx.spacing_a, 
+                         spacing_e=cfg.node_rx.spacing_e,
+                         steering_rate=0,
+                         Tanalysis=1,
+                         squint=0)
 
     for az_step in np.arange(az_steps, dtype=np.int):
 
@@ -469,18 +515,38 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
         # ANTENNA PATTERN
         # FIXME: this assume co-located Tx and Rx, so it will not work for true bistatic configurations
         # Yuanhao: use drama antenna and antenna definition as used for performance
-        if cfg.sar.L_total:
-            beam_pattern = sinc_1tx_nrx(sin_az, ant_L * num_ch, f0, num_ch, field=True)
-        else:
-            beam_pattern = sinc_1tx_nrx(sin_az, ant_L, f0, 1, field=True)
+        # Fixed by consider the antenna patterms in the drama tool box
+        tx_pat, xpat = tx_ant.pat_2D(v, u, grid=False,
+                                     squint_rad=squint_r)
+        rx_pat, xpat = rx_ant.pat_2D(v, u, grid=False,
+                                     squint_rad=squint_r)
+        # generate the two-way antenna pattern
+        beam_pattern = tx_pat * rx_pat
+        
+#        if cfg.sar.L_total:
+#            tx_pat, xpat = tx_ant.pat_2D(v, u, grid=False,
+#                                         squint_rad=squint)
+#            rx_pat, xpat = rx_ant.pat_2D(v_b, u_b, grid=False,
+#                                         squint_rad=sesame_squint,
+#                                         steer_rad=score_steer)
+#            beam_pattern = tx_pat * rx_pat
+#            #beam_pattern = sinc_1tx_nrx(sin_az, ant_L * num_ch, f0, num_ch, field=True)
+#        else:
+#            beam_pattern = sinc_1tx_nrx(sin_az, ant_L, f0, 1, field=True)
+            
 
         ## GENERATE CHANEL PROFILES
         for ch in np.arange(num_ch, dtype=np.int):
-
+                               
             if do_hh:
                 scene_bp = scene_hh * beam_pattern
                 # Add channel phase & compute profile
-                scene_bp *= np.exp(-1j*k0*d_chan*ch*sin_az)
+                ## GENERATING CROSS-TRACK INSAR PHASE
+                if hasattr(cfg.sar, 'b_cross'):
+                    cr_phase = np.exp(-1j * k0 * cfg.sar.b_cross[ch] * (inc - np.radians(cfg.sar.b_roll[ch])))
+                    scene_bp *= cr_phase
+                else:
+                    scene_bp *= np.exp(-1j*k0*d_chan*ch*sin_az)
                 if use_numba:
                     raw.chan_profile_numba(sr_surface.flatten(),
                                            scene_bp.flatten(),
@@ -501,7 +567,12 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
             if do_vv:
                 scene_bp = scene_vv * beam_pattern
                 # Add channel phase & compute profile
-                scene_bp *= np.exp(-1j*k0*d_chan*ch*sin_az)
+                ## GENERATING CROSS-TRACK INSAR PHASE
+                if hasattr(cfg.sar, 'b_cross'):
+                    cr_phase = np.exp(-1j * k0 * cfg.sar.b_cross[ch] * (inc - np.radians(cfg.sar.b_roll[ch])))
+                    scene_bp *= cr_phase
+                else:
+                    scene_bp *= np.exp(-1j*k0*d_chan*ch*sin_az)
                 if use_numba:
                     raw.chan_profile_numba(sr_surface.flatten(),
                                            scene_bp.flatten(),
