@@ -244,18 +244,36 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
     # SR/GR/INC Matrixes
     sr0 = geosar.inc_to_sr(inc_angle, alt)
     gr0 = geosar.inc_to_gr(inc_angle, alt)
-    gr = surface.x + gr0
-    sr, inc, _ = geosar.gr_to_geo(gr, alt)
-    sr -= np.min(sr)
-    #inc = np.repeat(inc[np.newaxis, :], surface.Ny, axis=0)
-    #sr = np.repeat(sr[np.newaxis, :], surface.Ny, axis=0)
-    #gr = np.repeat(gr[np.newaxis, :], surface.Ny, axis=0)
-    #Let's try to safe some memory and some operations
-    inc = inc.reshape(1, inc.size)
-    sr = sr.reshape(1, sr.size)
-    gr = gr.reshape(1, gr.size)
-    sin_inc = np.sin(inc)
-    cos_inc = np.cos(inc)
+    # EXTENDED TO MULTI-CHANNEL CROSS-TRACK APPLICATION
+    if hasattr(cfg.sar, 'b_cross'):
+        gr = np.zeros((num_ch, np.size(surface.x)))
+        sr = np.zeros((num_ch, np.size(surface.x)))
+        inc = np.zeros((num_ch, np.size(surface.x)))
+        sin_inc = np.zeros((num_ch, np.size(surface.x)))
+        cos_inc = np.zeros((num_ch, np.size(surface.x)))
+        for ch in np.arange(num_ch, dtype=np.int):                        
+            gr[ch] = surface.x + gr0 + cfg.sar.b_cross[ch] * np.cos(np.radians(cfg.sar.b_roll[ch]))
+            sr[ch], inc[ch], _ = geosar.gr_to_geo(gr[ch], alt)
+            sr[ch] -= np.min(sr[ch])
+            inc[ch] = inc[ch].reshape(1, inc[ch].size)
+            sr[ch] = sr[ch].reshape(1, sr[ch].size)
+            gr[ch] = gr[ch].reshape(1, gr[ch].size)
+            sin_inc[ch] = np.sin(inc[ch])
+            cos_inc[ch] = np.cos(inc[ch])
+    else:
+        gr = surface.x + gr0 
+        sr, inc, _ = geosar.gr_to_geo(gr, alt)
+        sr -= np.min(sr)
+        #inc = np.repeat(inc[np.newaxis, :], surface.Ny, axis=0)
+        #sr = np.repeat(sr[np.newaxis, :], surface.Ny, axis=0)
+        #gr = np.repeat(gr[np.newaxis, :], surface.Ny, axis=0)
+        #Let's try to safe some memory and some operations
+        inc = inc.reshape(1, inc.size)
+        sr = sr.reshape(1, sr.size)
+        gr = gr.reshape(1, gr.size)
+        sin_inc = np.sin(inc)
+        cos_inc = np.cos(inc)
+            
 
     # lambda, K, resolution, time, etc.
     l0 = const.c/f0
@@ -328,15 +346,29 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
             U_vec = (cfg.ocean.wind_U *
                      np.array([np.cos(U_dir), np.sin(U_dir)]))
             U_eff_vec = U_vec - current_vec
-
-            rcs_bragg = rcs.RCSRomeiser97(k0, inc, pol,
-                                          surface.dx, surface.dy,
-                                          linalg.norm(U_eff_vec),
-                                          np.arctan2(U_eff_vec[1],
-                                                     U_eff_vec[0]),
-                                          surface.wind_fetch,
-                                          scat_bragg_spec, scat_bragg_spread,
-                                          scat_bragg_d)
+            rcs_bragg = []
+            if hasattr(cfg.sar, 'b_cross'):
+                for ch in np.arange(num_ch, dtype=np.int):   
+                    rcs_bragg = rcs.RCSRomeiser97(k0, inc[ch,:], pol,
+                                                      surface.dx, surface.dy,
+                                                      linalg.norm(U_eff_vec),
+                                                      np.arctan2(U_eff_vec[1],
+                                                                 U_eff_vec[0]),
+                                                      surface.wind_fetch,
+                                                      scat_bragg_spec, scat_bragg_spread,
+                                                      scat_bragg_d)
+                    rcs_bragg = np.append(rcs_bragg, rcs_bragg)
+            else:
+                 rcs_bragg = rcs.RCSRomeiser97(k0, inc, pol,
+                                               surface.dx, surface.dy,
+                                               linalg.norm(U_eff_vec),
+                                               np.arctan2(U_eff_vec[1],
+                                                          U_eff_vec[0]),
+                                               surface.wind_fetch,
+                                               scat_bragg_spec, scat_bragg_spread,
+                                               scat_bragg_d)
+                 rcs_bragg = np.append(rcs_bragg, rcs_bragg)
+                    
         else:
             raise NotImplementedError('RCS model %s for Bragg scattering not implemented' % scat_bragg_model)
 
@@ -349,7 +381,8 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
         
         
         print('Initializing antenna pattern...')
-        gr_m, y_m = np.meshgrid(gr,surface.y)
+        # FIXED ME: USING THE MASTER GEOMETRY AS REFERENCE
+        gr_m, y_m = np.meshgrid(surface.x + gr0,surface.y)
         sr_m = np.sqrt(gr_m**2 + y_m**2 + alt**2)
         v = np.arcsin(alt / sr_m)
         u = np.arcsin(y_m / sr_m)
@@ -403,114 +436,122 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
         az_proj_angle = np.arcsin(az / gr0)
 
         # Note: Projected displacements are added to slant range
-        sr_surface = (sr - cos_inc*surface.Dz + az/2*sin_az
-                         + surface.Dx*sin_inc + surface.Dy*sin_az)
+        if hasattr(cfg.sar, 'b_cross'):
+            sr_surface = np.zeros((num_ch, surface.Dz.shape[0], surface.Dz.shape[1]))
+            for ch in np.arange(num_ch, dtype=np.int):   
+                sr_surface[ch, :, :] = (sr[0,:] - cos_inc[ch,:] * surface.Dz + az / 2 * sin_az
+                              + surface.Dx * sin_inc[ch,:] + surface.Dy * sin_az)
+        else:
+            sr_surface = np.zeros((1, surface.Dz.shape[0], surface.Dz.shape[1]))
+            sr_surface[0, :, :] = (sr - cos_inc * surface.Dz + az / 2 * sin_az
+                              + surface.Dx * sin_inc + surface.Dy*sin_az)
 
         if do_hh:
-            scene_hh = np.zeros([int(surface.Ny), int(surface.Nx)], dtype=np.complex)
+            scene_hh = np.zeros([inc.shape[0], int(surface.Ny), int(surface.Nx)], dtype=np.complex)
         if do_vv:
-            scene_vv = np.zeros([int(surface.Ny), int(surface.Nx)], dtype=np.complex)
+            scene_vv = np.zeros([inc.shape[0], int(surface.Ny), int(surface.Nx)], dtype=np.complex)
         # Point target
         if add_point_target and rank == 0:
             sr_pt = (sr[0, surface.Nx/2] + az[surface.Ny/2, 0]/2 *
                      sin_az[surface.Ny/2, surface.Nx/2])
             pt_scat = (100. * np.exp(-1j * 2. * k0 * sr_pt))
             if do_hh:
-                scene_hh[surface.Ny/2, surface.Nx/2] = pt_scat
+                scene_hh[inc.shape[0], surface.Ny/2, surface.Nx/2] = pt_scat
             if do_vv:
-                scene_vv[surface.Ny/2, surface.Nx/2] = pt_scat
+                scene_vv[inc.shape[0], surface.Ny/2, surface.Nx/2] = pt_scat
             sr_surface[surface.Ny/2, surface.Nx/2] = sr_pt
-
-        # Specular
-        if scat_spec_enable:
-            if scat_spec_mode == 'kodis':
-                Esn_sp = np.sqrt(4.*np.pi)*rcs_spec.field(az_proj_angle, sr_surface,
-                                                          surface.Diffx, surface.Diffy,
-                                                          surface.Diffxx, surface.Diffyy, surface.Diffxy)
-                if do_hh:
-                    scene_hh += Esn_sp
-                if do_vv:
-                    scene_vv += Esn_sp
-            else:
-                # FIXME
-                if do_hh:
-                    pol_tmp = 'hh'
-                    Esn_sp = (np.exp(-1j*(2.*k0*sr_surface)) * (4.*np.pi)**1.5 *
-                              rcs_spec.field(1, 1, pol_tmp[0], pol_tmp[1],
-                                             inc, inc,
-                                             az_proj_angle, az_proj_angle + np.pi,
-                                             surface.Dz,
-                                             surface.Diffx, surface.Diffy,
-                                             surface.Diffxx,
-                                             surface.Diffyy,
-                                             surface.Diffxy))
-                    scene_hh += Esn_sp
-                if do_vv:
-                    pol_tmp = 'vv'
-                    Esn_sp = (np.exp(-1j*(2.*k0*sr_surface)) * (4.*np.pi)**1.5 *
-                              rcs_spec.field(1, 1, pol_tmp[0], pol_tmp[1],
-                                             inc, inc,
-                                             az_proj_angle, az_proj_angle + np.pi,
-                                             surface.Dz,
-                                             surface.Diffx, surface.Diffy,
-                                             surface.Diffxx,
-                                             surface.Diffyy,
-                                             surface.Diffxy))
-                    scene_vv += Esn_sp
-            NRCS_avg_hh[az_step] += (np.sum(np.abs(Esn_sp)**2) / surface_area)
-            NRCS_avg_vv[az_step] += NRCS_avg_hh[az_step]
-
-        # Bragg
-        if scat_bragg_enable:
-            if (t_now - t_last_rcs_bragg) > ocean_dt:
-
-                if scat_bragg_model == 'romeiser97':
-                    if pol == 'DP':
-                        RCS_bragg_hh, RCS_bragg_vv = rcs_bragg.rcs(az_proj_angle,
-                                                                   surface.Diffx,
-                                                                   surface.Diffy)
-                    elif pol=='hh':
-                        RCS_bragg_hh = rcs_bragg.rcs(az_proj_angle,
-                                                     surface.Diffx,
-                                                     surface.Diffy)
-                    else:
-                        RCS_bragg_vv = rcs_bragg.rcs(az_proj_angle,
-                                                     surface.Diffx,
-                                                     surface.Diffy)
-
-                if use_hmtf:
-                    # Fix Bad MTF points
-                    surface.hMTF[np.where(surface.hMTF < -1)] = -1
+        
+        for i in range(inc.shape[0]):
+            # Specular
+            if scat_spec_enable:
+                if scat_spec_mode == 'kodis':
+                    Esn_sp = np.sqrt(4.*np.pi)*rcs_spec.field(az_proj_angle, sr_surface[i,:, :],
+                                                              surface.Diffx, surface.Diffy,
+                                                              surface.Diffxx, surface.Diffyy, surface.Diffxy)
                     if do_hh:
-                        RCS_bragg_hh[0] *= (1 + surface.hMTF)
-                        RCS_bragg_hh[1] *= (1 + surface.hMTF)
+                        scene_hh += Esn_sp
                     if do_vv:
-                        RCS_bragg_vv[0] *= (1 + surface.hMTF)
-                        RCS_bragg_vv[1] *= (1 + surface.hMTF)
-
-                t_last_rcs_bragg = t_now
-
-            if do_hh:
-                scat_bragg_hh = np.sqrt(RCS_bragg_hh)
-                NRCS_bragg_hh_instant_avg = np.sum(RCS_bragg_hh) / surface_area
-                NRCS_avg_hh[az_step] += NRCS_bragg_hh_instant_avg
-            if do_vv:
-                scat_bragg_vv = np.sqrt(RCS_bragg_vv)
-                NRCS_bragg_vv_instant_avg = np.sum(RCS_bragg_vv) / surface_area
-                NRCS_avg_vv[az_step] += NRCS_bragg_vv_instant_avg
-
-
-            # Doppler phases (Note: Bragg radial velocity taken constant!)
-            surf_phase = - (2 * k0) * sr_surface
-            cap_phase = (2 * k0) * t_step * c_b * (az_step + 1)
-            phase_bragg[0] = surf_phase - cap_phase # + dop_phase_p
-            phase_bragg[1] = surf_phase + cap_phase # + dop_phase_m
-            bragg_scats[0] = rndscat_m.scats(t_now)
-            bragg_scats[1] = rndscat_p.scats(t_now)
-            if do_hh:
-                scene_hh += ne.evaluate('sum(scat_bragg_hh * exp(1j*phase_bragg) * bragg_scats, axis=0)')
-            if do_vv:
-                scene_vv += ne.evaluate('sum(scat_bragg_vv * exp(1j*phase_bragg) * bragg_scats, axis=0)')
+                        scene_vv += Esn_sp
+                else:
+                    # FIXME
+                    if do_hh:
+                        pol_tmp = 'hh'
+                        Esn_sp = (np.exp(-1j*(2.*k0*sr_surface[i,:, :])) * (4.*np.pi)**1.5 *
+                                  rcs_spec.field(1, 1, pol_tmp[0], pol_tmp[1],
+                                                 inc[i,:], inc[i,:],
+                                                 az_proj_angle, az_proj_angle + np.pi,
+                                                 surface.Dz,
+                                                 surface.Diffx, surface.Diffy,
+                                                 surface.Diffxx,
+                                                 surface.Diffyy,
+                                                 surface.Diffxy))
+                        scene_hh[i,:] += Esn_sp
+                    if do_vv:
+                        pol_tmp = 'vv'
+                        Esn_sp = (np.exp(-1j*(2.*k0*sr_surface[i,:, :])) * (4.*np.pi)**1.5 *
+                                  rcs_spec.field(1, 1, pol_tmp[0], pol_tmp[1],
+                                                 inc[i,:], inc[i,:],
+                                                 az_proj_angle, az_proj_angle + np.pi,
+                                                 surface.Dz,
+                                                 surface.Diffx, surface.Diffy,
+                                                 surface.Diffxx,
+                                                 surface.Diffyy,
+                                                 surface.Diffxy))
+                        scene_vv[i,:] += Esn_sp
+                NRCS_avg_hh[az_step] += (np.sum(np.abs(Esn_sp)**2) / surface_area)
+                NRCS_avg_vv[az_step] += NRCS_avg_hh[az_step]
+    
+            # Bragg
+            if scat_bragg_enable:
+                if (t_now - t_last_rcs_bragg) > ocean_dt:
+            ##FIXED ME: FOR THE INTERFEOMETRIC CASE, USE THE REFERNCE IMAGE AS BRAGG THING
+                    if scat_bragg_model == 'romeiser97':
+                        if pol == 'DP':
+                            RCS_bragg_hh, RCS_bragg_vv = rcs_bragg[0].rcs(az_proj_angle,
+                                                                       surface.Diffx,
+                                                                       surface.Diffy)
+                        elif pol=='hh':
+                            RCS_bragg_hh = rcs_bragg[0].rcs(az_proj_angle,
+                                                         surface.Diffx,
+                                                         surface.Diffy)
+                        else:
+                            RCS_bragg_vv = rcs_bragg[0].rcs(az_proj_angle,
+                                                         surface.Diffx,
+                                                         surface.Diffy)
+    
+                    if use_hmtf:
+                        # Fix Bad MTF points
+                        surface.hMTF[np.where(surface.hMTF < -1)] = -1
+                        if do_hh:
+                            RCS_bragg_hh[0] *= (1 + surface.hMTF)
+                            RCS_bragg_hh[1] *= (1 + surface.hMTF)
+                        if do_vv:
+                            RCS_bragg_vv[0] *= (1 + surface.hMTF)
+                            RCS_bragg_vv[1] *= (1 + surface.hMTF)
+    
+                    t_last_rcs_bragg = t_now
+    
+                if do_hh:
+                    scat_bragg_hh = np.sqrt(RCS_bragg_hh)
+                    NRCS_bragg_hh_instant_avg = np.sum(RCS_bragg_hh) / surface_area
+                    NRCS_avg_hh[az_step] += NRCS_bragg_hh_instant_avg
+                if do_vv:
+                    scat_bragg_vv = np.sqrt(RCS_bragg_vv)
+                    NRCS_bragg_vv_instant_avg = np.sum(RCS_bragg_vv) / surface_area
+                    NRCS_avg_vv[az_step] += NRCS_bragg_vv_instant_avg
+    
+    
+                # Doppler phases (Note: Bragg radial velocity taken constant!)
+                surf_phase = - (2 * k0) * sr_surface[i,:, :]
+                cap_phase = (2 * k0) * t_step * c_b[0,:] * (az_step + 1)
+                phase_bragg[0] = surf_phase - cap_phase # + dop_phase_p
+                phase_bragg[1] = surf_phase + cap_phase # + dop_phase_m
+                bragg_scats[0] = rndscat_m.scats(t_now)
+                bragg_scats[1] = rndscat_p.scats(t_now)
+                if do_hh:
+                    scene_hh[i,:] += ne.evaluate('sum(scat_bragg_hh * exp(1j*phase_bragg) * bragg_scats, axis=0)')
+                if do_vv:
+                    scene_vv[i,:] += ne.evaluate('sum(scat_bragg_vv * exp(1j*phase_bragg) * bragg_scats, axis=0)')
 
         # ANTENNA PATTERN
         # FIXME: this assume co-located Tx and Rx, so it will not work for true bistatic configurations
@@ -521,6 +562,7 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
         rx_pat, xpat = rx_ant.pat_2D(v, u, grid=False,
                                      squint_rad=squint_r)
         # generate the two-way antenna pattern
+        beam_pattern_mono = tx_pat * tx_pat
         beam_pattern = tx_pat * rx_pat
         
 #        if cfg.sar.L_total:
@@ -539,13 +581,20 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
         for ch in np.arange(num_ch, dtype=np.int):
                                
             if do_hh:
-                scene_bp = scene_hh * beam_pattern
                 # Add channel phase & compute profile
                 ## GENERATING CROSS-TRACK INSAR PHASE
                 if hasattr(cfg.sar, 'b_cross'):
-                    cr_phase = np.exp(-1j * k0 * cfg.sar.b_cross[ch] * (inc - np.radians(cfg.sar.b_roll[ch])))
+                    if cfg.sar.b_cross[ch]==0:
+                        scene_bp = scene_hh[ch,:] * beam_pattern_mono
+                    else:
+                        scene_bp = scene_hh[ch,:] * beam_pattern
+                    cr_phase = np.exp(-1j * k0 * cfg.sar.b_cross[ch] * (inc[i,:] - np.radians(cfg.sar.b_roll[ch])))
                     scene_bp *= cr_phase
                 else:
+                    if ch==0:
+                        scene_bp = scene_hh * beam_pattern_mono
+                    else:
+                        scene_bp = scene_hh * beam_pattern
                     scene_bp *= np.exp(-1j*k0*d_chan*ch*sin_az)
                 if use_numba:
                     raw.chan_profile_numba(sr_surface.flatten(),
@@ -565,13 +614,20 @@ def sarraw(cfg_file, output_file, ocean_file, reuse_ocean_file, errors_file, reu
                                            n_sinc_samples, sinc_ovs,
                                            proc_raw_hh[ch][az_step])
             if do_vv:
-                scene_bp = scene_vv * beam_pattern
                 # Add channel phase & compute profile
                 ## GENERATING CROSS-TRACK INSAR PHASE
                 if hasattr(cfg.sar, 'b_cross'):
-                    cr_phase = np.exp(-1j * k0 * cfg.sar.b_cross[ch] * (inc - np.radians(cfg.sar.b_roll[ch])))
+                    if cfg.sar.b_cross[ch]==0:
+                        scene_bp = scene_vv[ch,:] * beam_pattern_mono
+                    else:
+                        scene_bp = scene_vv[ch,:] * beam_pattern
+                    cr_phase = np.exp(-1j * k0 * cfg.sar.b_cross[ch] * (inc[i,:] - np.radians(cfg.sar.b_roll[ch])))
                     scene_bp *= cr_phase
                 else:
+                    if ch==0:
+                        scene_bp = scene_vv * beam_pattern_mono
+                    else:
+                        scene_bp = scene_vv * beam_pattern
                     scene_bp *= np.exp(-1j*k0*d_chan*ch*sin_az)
                 if use_numba:
                     raw.chan_profile_numba(sr_surface.flatten(),
@@ -702,3 +758,10 @@ if __name__ == '__main__':
     sarraw(args.cfg_file, args.output_file,
            args.ocean_file, args.reuse_ocean_file,
            args.errors_file, args.reuse_errors_file)
+#    
+#        sarraw(r"D:\research\TU Delft\programs\OceanSAR\oceansar\par\sim_example.cfg",
+#            r"D:\research\TU Delft\ESA_cube proposal\data\processed_data\out1.nc",
+#           r"D:\research\TU Delft\ESA_cube proposal\data\processed_data\out2.nc",
+#           False,
+#           False,
+#           False)
